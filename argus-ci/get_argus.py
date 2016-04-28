@@ -41,6 +41,261 @@ class Worker(object):
         return result
 
 
+class Action(Worker):
+
+    """Contract class for all the commands."""
+
+    def __init__(self, parent, parser):
+        super(Action, self).__init__()
+        self._args = None
+        self._command_line = None
+        self._parent = parent
+        self._parser = parser
+
+        self.setup()
+
+    @property
+    def parent(self):
+        """Return the object that contains the current command."""
+        return self._parent
+
+    @property
+    def args(self):
+        """The command line arguments parsed by the client."""
+        if self._args is None:
+            self._args = self._discover_attribute("args")
+        return self._args
+
+    @property
+    def command_line(self):
+        """Command line provided to parser."""
+        if self._command_line is None:
+            self._command_line = self._discover_attribute("command_line")
+
+        return self._command_line
+
+    def _discover_attribute(self, attribute):
+        """Search for the received attribute in the command tree."""
+        command_tree = [self.parent]
+        while command_tree:
+            parent = command_tree.pop()
+            if hasattr(parent, attribute):
+                return getattr(parent, attribute)
+            elif parent.parent is not None:
+                command_tree.append(parent.parent)
+
+        raise ValueError("The %(attribute)s attribute is missing from the "
+                         "client tree." % {"attribute": attribute})
+
+    def task_done(self, result):
+        """What to execute after successfully finished processing a task."""
+        pass
+
+    def task_fail(self, exc):
+        """What to do when the program fails processing a task."""
+        raise exc
+
+    def interrupted(self):
+        """What to execute when keyboard interrupts arrive."""
+        raise KeyboardInterrupt()
+
+    @abc.abstractmethod
+    def setup(self):
+        """Extend the parser configuration in order to expose this command."""
+        pass
+
+    @abc.abstractmethod
+    def _work(self):
+        """Override this with your desired procedures."""
+        pass
+
+
+class Group(object):
+
+    """Contract class for all the command groups.
+
+    :ivar: commands: A list which contains (command, parser_name) tuples.
+
+    ::
+    Example:
+    ::
+        class Example(Group):
+
+            commands = [
+                (ExampleOne, "main_parser"),
+                (ExampleTwo, "main_parser),
+                (ExampleThree, "second_parser")
+            ]
+
+            # ...
+    """
+
+    commands = None
+
+    def __init__(self, parent, parser):
+        super(Group, self).__init__()
+        self._parent = parent
+        self._parser = parser
+        self._parsers = {}
+        self._childs = []
+
+        self.setup()            # Setup the current command group
+        self._bind_commands()   # Bind all the received commands
+
+    @property
+    def parent(self):
+        """Return the object that contains the current command group."""
+        return self._parent
+
+    def _bind_commands(self):
+        """Bind the received commands to the current command group."""
+        for command, parser in self.commands or ():
+            if not self.check_command(command):
+                continue
+            self.bind(command, parser)
+
+    def _register_parser(self, name, parser):
+        """Register a new parser in this command."""
+        self._parsers[name] = parser
+
+    def _get_parser(self, name):
+        """Get an parser from the current command group."""
+        try:
+            return self._parsers[name]
+        except KeyError:
+            raise ValueError("Invalid parser name %(name)s" %
+                             {"name": name})
+
+    def check_command(self, command):
+        """Check if the received command is valid and can be
+        property used.
+        """
+        if not issubclass(command, (Command, Group)):
+            return False
+
+        return True
+
+    def bind(self, command, parser_name):
+        """Bind the received command to the current one."""
+        parser = self._get_parser(parser_name)
+        self._childs.append(command(self, parser))
+
+    @abc.abstractmethod
+    def setup(self):
+        """Extend the parser configuration in order to expose this command."""
+        pass
+
+
+class CliApplication(Group, Worker):
+
+    """Contract class for all the command line applications.
+
+    :ivar: commands: A list which contains (command, parser_name) tuples
+
+    ::
+    Example:
+    ::
+        class Example(CommandGroup):
+
+            commands = [
+                (ExampleOne, "main_parser"),
+                (ExampleTwo, "main_parser),
+                (ExampleThree, "second_parser")
+            ]
+
+            # ...
+    """
+
+    def __init__(self, command_line):
+        super(CliApplication, self).__init__(parent=None, parser=None)
+        self._args = None
+        self._command_line = command_line
+        self._logger = None
+
+    @property
+    def args(self):
+        """The arguments after the command line was parsed."""
+        return self._args
+
+    @property
+    def command_line(self):
+        """Command line provided to parser."""
+        return self._command_line
+
+    @property
+    def logger(self):
+        """Expose the logger object."""
+        if not self._logger:
+            level = (logging.DEBUG if self.args.verbose
+                     else logging.ERROR)
+            self._logger = self._get_logger(__name__, level)
+        return self._logger
+
+    @staticmethod
+    def _get_logger(name, level):
+        """Obtain a new logger object."""
+        logger = logging.getLogger(name)
+        formatter = logging.Formatter("%(asctime)s - %(name)s - "
+                                      "%(levelname)s - %(message)s")
+
+        if not logger.handlers:
+            # If the logger wasn't obtained another time,
+            # then it shouldn't have any loggers
+
+            stdout_handler = logging.StreamHandler(sys.stdout)
+            stdout_handler.setFormatter(formatter)
+            logger.addHandler(stdout_handler)
+
+        logger.setLevel(level)
+        return logger
+
+    def task_done(self, result):
+        """What to execute after successfully finished processing a task."""
+        pass
+
+    def task_fail(self, exc):
+        """What to do when the program fails processing a task."""
+        pass
+
+    def interrupted(self):
+        """What to execute when keyboard interrupts arrive."""
+        pass
+
+    @abc.abstractmethod
+    def setup(self):
+        """Extend the parser configuration in order to expose all
+        the received commands.
+
+        Exemple:
+        ::
+            # ...
+            self._parser = argparse.ArgumentParser(
+                description=description)
+            self._main_parser.add_argument(
+                "--example", help="just an example")
+            subcommands = self._parser.add_subparsers(
+                title="[sub-commands]")
+            self._register_parser("subcommands", subcommands)
+            # ...
+        """
+        pass
+
+    def prologue(self):
+        """Executed once before the command running."""
+        self._args = self._parser.parse_args(self.command_line)
+
+    def _work(self):
+        """Parse the command line."""
+        if not self._args:
+            return
+
+        work_function = getattr(self._args, "work", None)
+        if not work_function:
+            return
+
+        return work_function()
+
+
 @six.add_metaclass(abc.ABCMeta)
 class Task(Worker):
 
@@ -80,65 +335,6 @@ class Task(Worker):
             self.task_done(result)
         self._epilogue()
         return result
-
-
-@six.add_metaclass(abc.ABCMeta)
-class Executor(Worker):
-
-    """Contract class for all the executors."""
-
-    def __init__(self, delay, loop):
-        super(Executor, self).__init__()
-        self._queue = []
-        self._delay = delay
-        self._loop = loop
-
-    @abc.abstractmethod
-    def on_task_done(self, task, result):
-        """What to execute after successfully finished processing a task."""
-        pass
-
-    @abc.abstractmethod
-    def on_task_fail(self, task, exc):
-        """What to do when the program fails processing a task."""
-        pass
-
-    @abc.abstractmethod
-    def on_interrupted(self):
-        """What to execute when keyboard interrupts arrive."""
-        pass
-
-    def _get_task(self):
-        """Retrieves a task from the queue."""
-        if self._queue:
-            return self._queue.pop(0)
-
-    def _work(self):
-        """Run the received task and process the result."""
-        # pylint: disable=broad-except
-        task = self._get_task()
-        if task and isinstance(task, Task):
-            try:
-                task.run()
-            except Exception as exc:
-                self.on_task_fail(task, exc)
-
-    def put_task(self, task):
-        """Adds a task to the tasks queue."""
-        if not isinstance(task, Task):
-            raise ValueError("Invalid type of task provided.")
-        self._queue.append(task)
-
-    def run(self):
-        """Processes incoming tasks."""
-        self._prologue()
-        while self._queue:
-            try:
-                self._work()
-            except KeyboardInterrupt:
-                self.on_interrupted()
-                break
-        self._epilogue()
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -247,116 +443,12 @@ class Command(Task):
                     raise
 
 
-class Application(Executor):
-
-    def __init__(self):
-        super(Application, self).__init__(delay=0, loop=False)
-        self._config = {}
-        self._logger = None
-
-    @property
-    def config(self):
-        """Expose the arguments received from the client."""
-        if not self._config:
-            self._config = vars(self._get_config())
-
-        return self._config
-
-    @property
-    def logger(self):
-        """Expose the logger object."""
-        if not self._logger:
-            level = (logging.DEBUG if self.config.get('verbose')
-                     else logging.ERROR)
-            self._logger = self._get_logger(__name__, level)
-        return self._logger
-
-    @staticmethod
-    def _get_logger(name, level):
-        """Obtain a new logger object."""
-        logger = logging.getLogger(name)
-        formatter = logging.Formatter("%(asctime)s - %(name)s - "
-                                      "%(levelname)s - %(message)s")
-
-        if not logger.handlers:
-            # If the logger wasn't obtained another time,
-            # then it shouldn't have any loggers
-
-            stdout_handler = logging.StreamHandler(sys.stdout)
-            stdout_handler.setFormatter(formatter)
-            logger.addHandler(stdout_handler)
-
-        logger.setLevel(level)
-        return logger
-
-    @staticmethod
-    def _get_config():
-        """Process the information received from the client."""
-        parser = argparse.ArgumentParser(
-            description="Install the Argus-CI on the current machine.")
-
-        parser.add_argument(
-            "--attempts", dest="attempts", type=int, default=3,
-            help="Interval between execute attempts, in seconds. "
-                 "(Default: 3)")
-        parser.add_argument(
-            "--retry_interval", dest="retry_interval",
-            type=float, default=0.1,
-            help="How many times to retry running the command. "
-                 "(Default: 0.1)")
-
-        group = parser.add_mutually_exclusive_group()
-        group.add_argument(
-            "--no-venv", dest="setup_venv", action="store_false",
-            help="Install the requirements on the global environment")
-        group.add_argument(
-            "--venv", dest="venv", type=str,
-            default=os.path.expanduser("~/argus-env"),
-            help="The path for the virtual environment. "
-                 "(Default: ~/argus-env)"
-        )
-
-        parser.add_argument(
-            "--argus-branch", dest="argus_branch", default="master",
-            help="the required branch / revision of argus repository "
-                 "(Default: master)")
-        parser.add_argument(
-            "--tempest-branch", dest="tempest_branch", default="tags/7",
-            help="the required branch / revision of argus repository "
-                 "(Default: tags/7)")
-
-        group = parser.add_mutually_exclusive_group()
-        group.add_argument("-v", "--verbose", action="store_true",
-                           default=False)
-        group.add_argument("-q", "--quiet", action="store_true",
-                           default=False)
-
-        return parser.parse_args()
-
-    def on_task_done(self, task, result):
-        """What to execute after successfully finished processing a task."""
-        self.logger.info("The task %r was successfully processed. "
-                         "(result: %s)", task, result)
-
-    def on_task_fail(self, task, exc):
-        """What to do when the program fails processing a task."""
-        self.logger.error("The processing of the %r failled: %s.", task, exc)
-        if isinstance(exc, subprocess.CalledProcessError):
-            stdout, stderr = getattr(exc, "output", ('', ''))
-            self.logger.debug("Task %r stdout: %s", task.name, stdout)
-            self.logger.debug("Task %r stderr: %s", task.name, stderr)
-
-    def on_interrupted(self):
-        """What to execute when keyboard interrupts arrive."""
-        raise KeyboardInterrupt()
-
-
-class SetupEnvironment(Command):
+class _SetupEnvironment(Command):
 
     """Command used for installing the global requirements."""
 
     def __init__(self, executor):
-        super(SetupEnvironment, self).__init__(executor=executor)
+        super(_SetupEnvironment, self).__init__(executor=executor)
         self._routes = {
             "win32": {"default": None},
             "linux2": {"default": "_ubuntu_14_04"},
@@ -381,7 +473,7 @@ class SetupEnvironment(Command):
             method()
 
 
-class CreateEnvironment(Command):
+class _CreateEnvironment(Command):
 
     """Command used for creating virtual environment for Argus-CI."""
 
@@ -403,19 +495,19 @@ class CreateEnvironment(Command):
             self._execute([self._pip, "install", "pip", "--upgrade"])
 
 
-class InstallTempest(Command):
+class _InstallTempest(Command):
 
     """Command used for installing tempest and its requirements."""
 
     REPO = 'https://github.com/openstack/tempest.git'
 
     def __init__(self, executor):
-        super(InstallTempest, self).__init__(executor=executor)
+        super(_InstallTempest, self).__init__(executor=executor)
         self._clone_path = "/tmp/tempest"
 
     def _prologue(self):
         """Executed once before the command running."""
-        super(InstallTempest, self)._prologue()
+        super(_InstallTempest, self)._prologue()
         branch = self._executor.config.get('tempest_branch')
 
         if os.path.isdir(self._clone_path):
@@ -440,19 +532,19 @@ class InstallTempest(Command):
         # TODO(alexandrucoman): Create the config file
 
 
-class InstallArgusCi(Command):
+class _InstallArgusCi(Command):
 
     """Command used for installing argus-ci and its requirements."""
 
     REPO = 'https://github.com/cloudbase/cloudbase-init-ci'
 
     def __init__(self, executor):
-        super(InstallArgusCi, self).__init__(executor=executor)
+        super(_InstallArgusCi, self).__init__(executor=executor)
         self._clone_path = "/tmp/argus"
 
     def _prologue(self):
         """Executed once before the command running."""
-        super(InstallArgusCi, self)._prologue()
+        super(_InstallArgusCi, self)._prologue()
         branch = self._executor.config.get('argus_branch')
 
         if os.path.isdir(self._clone_path):
@@ -475,22 +567,95 @@ class InstallArgusCi(Command):
         # TODO(alexandrucoman): Create the config file
 
 
+class InstallArgusCi(Action):
+
+    """Install the Argus-CI on the current machine."""
+
+    def setup(self):
+        """Extend the parser configuration in order to expose all
+        the received commands.
+        """
+        parser = self._parser.add_parser(
+            "install",
+            help="Install the Argus-CI on the current machine.")
+
+        parser.add_argument(
+            "--argus-branch", dest="argus_branch",
+            default=os.environ.get("ARGUS_BRANCH", "master"),
+            help="the required branch / revision of argus repository "
+                 "(Default: master)")
+        parser.add_argument(
+            "--tempest-branch", dest="tempest_branch",
+            default=os.environ.get("TEMPEST_BRANCH", "tags/7"),
+            help="the required branch / revision of argus repository "
+                 "(Default: tags/7)")
+
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument(
+            "--no-venv", dest="setup_venv", action="store_false",
+            help="Install the requirements on the global environment")
+        group.add_argument(
+            "--venv", dest="venv", type=str,
+            default=os.path.expanduser("~/argus-env"),
+            help="The path for the virtual environment. "
+                 "(Default: ~/argus-env)"
+        )
+
+        parser.set_defaults(work=self.run)
+
+    def _work(self):
+        """Install the Argus-CI on the current machine."""
+        tasks = (
+            _SetupEnvironment,   # Install all the requirements for Argus-Ci
+            _CreateEnvironment,  # Create the virtual environment for Argus-Ci
+            _InstallTempest,     # Install Tempest and its requirements
+            _InstallArgusCi      # Install Arugs-Ci and its requirements
+        )
+
+        for task in tasks:
+            task(self).run()
+
+
+class ArgusClient(CliApplication):
+
+    """Command line application for deploying Argus-Ci."""
+
+    commands = [
+        (InstallArgusCi, "commands"),
+    ]
+
+    def setup(self):
+        """Extend the parser configuration in order to expose all
+        the received commands.
+        """
+        self._parser = argparse.ArgumentParser()
+        self._parser.add_argument(
+            "--attempts", dest="attempts", type=int,
+            default=int(os.environ.get("ARGUS_ATTEMPTS", 3)),
+            help="Interval between execute attempts, in seconds. "
+                 "(Default: 3)")
+        self._parser.add_argument(
+            "--retry_interval", dest="retry_interval", type=float,
+            default=float(os.environ.get("ARGUS_RETRY_INTERVAL", 0.1)),
+            help="How many times to retry running the command. "
+                 "(Default: 0.1)")
+
+        group = self._parser.add_mutually_exclusive_group()
+        group.add_argument("-v", "--verbose", action="store_true",
+                           default=False)
+        group.add_argument("-q", "--quiet", action="store_true",
+                           default=False)
+
+        commands = self._parser.add_subparsers(title="[commands]",
+                                               dest="command")
+
+        self._register_parser("commands", commands)
+
+
 def main():
-    """Run the command line application."""
-    application = Application()
-
-    if os.geteuid() == 0:
-        application.put_task(task=SetupEnvironment(application))
-
-    # Create the virtual environment for Argus-Ci
-    application.put_task(task=CreateEnvironment(application))
-    # Install Tempest and its requirements
-    application.put_task(task=InstallTempest(application))
-    # Install Arugs-Ci and its requirements
-    application.put_task(task=InstallArgusCi(application))
-    # Run the application
-
-    application.run()
+    """Run the Jarvis command line application."""
+    jarvis = ArgusClient(sys.argv[1:])
+    jarvis.run()
 
 
 if __name__ == "__main__":
